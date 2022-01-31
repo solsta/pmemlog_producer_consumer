@@ -8,12 +8,45 @@
 #include <stdbool.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <library.h>
+#include <libpmemobj/base.h>
+#include <libpmemobj/pool_base.h>
+#include <libpmemobj/types.h>
 
 #define POOL_SIZE 8000000
-#define MAX_OPS_IN_THE_LOG 50
+#define MAX_OPS_IN_THE_LOG 110
 
 PMEMlogpool *plp_dest;
 PMEMlogpool *plp_src;
+int commit_flags;
+
+struct my_root {
+    int replay_last_transaction;
+    bool tx_is_running;
+    int recovery_count;
+    long offset;
+    char pmem_start[64000000];
+};
+
+
+int last_operation_status(){
+    PMEMobjpool *pop;
+    PMEMoid root;
+    struct my_root *rootp;
+    char *path_to_pmem = "/mnt/dax/test_outputs/mmaped_files/pmem_file_copy";
+    printf("File name: %s\n", path_to_pmem);
+    printf("trying to open file\n");
+    if ((pop = pmemobj_open(path_to_pmem, POBJ_LAYOUT_NAME(list))) == NULL) {
+        perror("failed to open pool\n");
+    }
+    root = pmemobj_root(pop, sizeof(struct my_root));
+    printf("File opened");
+    rootp = pmemobj_direct(root);
+    printf("Status of last transaction was: %d\n", rootp->replay_last_transaction);
+    int commit_status = rootp->replay_last_transaction;
+    pmemobj_close(pop);
+    return commit_status;
+}
 
 void log_commit_flag(char *command){
     if (pmemlog_append(plp_dest, command, strlen(command)) < 0) {
@@ -21,7 +54,9 @@ void log_commit_flag(char *command){
         exit(1);
     }
 }
-
+    //PMEMoid root;
+    //struct my_root *rootp;
+    /* Change to a safe imlementation */
 static int
 process_log(const void *buf, size_t len, void *arg)
 {   /* Logic to iterate over each command individually */
@@ -49,7 +84,7 @@ process_log(const void *buf, size_t len, void *arg)
 static int
 printit_dest(const void *buf, size_t len, void *arg)
 {
-    int commited_Records = 0;
+    printf("Dest walk\n");
     char tmp;
     memcpy(&tmp, buf, 1);
     int num_of_elements = 0;
@@ -58,7 +93,7 @@ printit_dest(const void *buf, size_t len, void *arg)
         memcpy(&tmp, buf+num_of_elements, 1);
 
     }
-    commited_Records = num_of_elements;
+    commit_flags = commit_flags + num_of_elements;
     return 0;
 }
 
@@ -138,15 +173,7 @@ void log_command(char *command){
 }
 
 PMEMlogpool *create_dest_log_file(char *path){
-
-    //char *directory;
-    //directory = "/mnt/dax/test_outputs/pmem_logs/psm";
     size_t nbyte;
-    //char *str;
-
-    //char *path = calloc(strlen(file_name)+strlen(directory), 1);
-    //strcat(path, directory);
-    //strcat(path, file_name);
 
     /* create the pmemlog pool or open it if it already exists */
     PMEMlogpool *plp_dest = pmemlog_create(path, POOL_SIZE, 0666);
@@ -158,11 +185,6 @@ PMEMlogpool *create_dest_log_file(char *path){
         perror(path);
         exit(1);
     }
-
-    /* how many bytes does the log hold? */
-    nbyte = pmemlog_nbyte(plp_dest);
-    printf("log holds %zu bytes\n", nbyte);
-    printf("Dest log created\n");
     return plp_dest;
 }
 
@@ -173,6 +195,7 @@ void run_producer(){
         log_command("d");
         log_command ("i");
     }
+    pmemlog_close(plp_src);
 }
 bool recovering;
 char *get_lowest_index_that_can_be_processed(char *directory_path){
@@ -197,24 +220,34 @@ char *get_lowest_index_that_can_be_processed(char *directory_path){
     }
     printf("Lowest available index is %d\n", min_index);
 
+
+    char *sequence_number = malloc(3);
+    sprintf(sequence_number, "%d",min_index);
+
     if(files_in_the_directory <= 1 && !recovering){
         printf("Nothing to consume, waiting\n");
+        char *last_file = calloc(strlen(directory_path)+strlen(sequence_number), 1);
+        strcat(last_file, directory_path);
+        strcat(last_file, sequence_number);
+        /* Try opening a file and if this fails. than wait */
+
+        plp_src = pmemlog_open(last_file);
+
+        if (plp_src == NULL) {
+            printf("Last log file is currently being used\n");
+            printf("Last file: %s\n", last_file);
+            perror("File open\n");
+        } else{
+            printf("Consuming the last log file\n");
+            pmemlog_close(plp_src);
+            return sequence_number;
+        }
         return NULL;
     }
-/*
-    char *sequence_number = malloc(3);
-    char *new_file_ptr = calloc(strlen(directory_path) + strlen(sequence_number), 1);
-    sprintf(sequence_number, "%d",min_index);
-    strcat(new_file_ptr, directory_path);
-    strcat(new_file_ptr, sequence_number);
-*/
-    char *sequence_number = malloc(3);
-    sprintf(sequence_number, "%d",min_index);
     return sequence_number;
 }
 
 char *concat_dir_and_filename(char *dir_name, char *file_name){
-   // char *sm_directory = "/mnt/dax/test_outputs/pmem_logs/sm/";
     char *full_path = calloc(strlen(dir_name)+ strlen(file_name), 1);
     strcat(full_path, dir_name);
     strcat(full_path, file_name);
@@ -234,8 +267,6 @@ void run_consumer(){
         run_consumer();
     }
     /* Process */
-    printf("Processing index: %s\n", index);
-    //pmemlog_close(plp_src);
     char *plp_src_path = concat_dir_and_filename("/mnt/dax/test_outputs/pmem_logs/sm/", index);
     plp_src = pmemlog_create(plp_src_path, POOL_SIZE, 0666);
     if (plp_src == NULL)
@@ -247,12 +278,11 @@ void run_consumer(){
     }
     char *plp_dest_path = concat_dir_and_filename("/mnt/dax/test_outputs/pmem_logs/psm/", index);
     plp_dest = create_dest_log_file(plp_dest_path);
-    printf("About to walk\n");
+
     pmemlog_walk(plp_src, 0, process_log, NULL);
-    printf("Consumer finished\n");
+
     /* Delete */
     pmemlog_close(plp_src);
-
     pmemlog_close(plp_dest);
     //unlink(plp_src_path);
 
@@ -262,28 +292,120 @@ void run_consumer(){
     } else{
         printf("Could not delete\n");
     }
-    sleep(10);
+    if (remove(plp_dest_path) == 0){
+        printf("%s was deleted\n", plp_dest_path);
+        /* Once we delete the log file, there is no need to keep track of comited records,
+         * so psm log file can also be deleted.
+         * */
+    } else{
+        printf("Could not delete\n");
+    }
+    //sleep(10);
     run_consumer();
 }
 
+int last_operation_status_stub(){
+    return 0;
+}
 
+void execute_in_recovery_mode(){
+    /* Get number of commited messages */
+    /* Iterate over each file in the directory and count commit messages */
+    char *index;
+    commit_flags = 0;
+    index = get_lowest_index_that_can_be_processed("/mnt/dax/test_outputs/pmem_logs/sm/");
+    char *file_path = concat_dir_and_filename("/mnt/dax/test_outputs/pmem_logs/psm/", index);
+    printf("PATH: %s\n", file_path);
+    PMEMlogpool *plp_dest = pmemlog_open(file_path);
+    if (plp_dest != NULL){
+        pmemlog_walk(plp_dest, 0, printit_dest, NULL);
+        printf("Commited messages: %d\n", commit_flags);
+
+        int commit_last_operation = last_operation_status_stub();
+        printf("Last operation status: %d\n", commit_last_operation);
+        int total_skip = commit_flags + commit_last_operation;
+        printf("Messages left to process: %d\n", MAX_OPS_IN_THE_LOG - total_skip);
+        printf("Starting log consumption:\n");
+        /* TODO */
+        /* Add required logic to run consumer */
+        /* Get status of the last operation */
+        /* add them up */
+        /* start consumer and ignore the first x operations + write to the logname with _rec extension*/
+    } else{
+        /* Run in a normal mode from the current log file */
+        printf("Starting normal log processing\n");
+        run_consumer();
+    }
+}
+
+bool file_exists(const char *path){
+    return access(path, F_OK) != 0;
+}
+
+
+void *create_dummy_pmem_file(){
+    static PMEMobjpool *pop;
+    static PMEMoid root;
+    struct my_root *rootp;
+
+    char *path_to_pmem = "/mnt/dax/test_outputs/mmaped_files/pmem_file_copy";
+    printf("File name: %s\n", path_to_pmem);
+    printf("trying to open file\n");
+    if (file_exists((path_to_pmem)) != 0) {
+        if ((pop = pmemobj_create(path_to_pmem, POBJ_LAYOUT_NAME(list),
+                                  PMEMOBJ_MIN_POOL, 0666)) == NULL) {
+            perror("failed to create pool\n");
+        }
+    } else {
+        if ((pop = pmemobj_open(path_to_pmem, POBJ_LAYOUT_NAME(list))) == NULL) {
+            perror("failed to open pool\n");
+        }
+    }
+    root = pmemobj_root(pop, sizeof(struct my_root));
+    printf("File opened\n");
+    rootp = pmemobj_direct(root);
+    printf("Direct\n");
+    //D_RW(root)->replay_last_transaction = 1;
+    //rootp->replay_last_transaction = 1;
+    //rootp->tx_is_running = true;
+    //memcpy(rootp->replay_last_transaction, true, sizeof(bool));
+    printf("Closing\n");
+    //pmemobj_close(pop);
+    memcpy(rootp->pmem_start, "true", strlen("true")+1);
+    printf("Done\n");
+
+    return rootp->pmem_start;
+}
 
 int
 main(int argc, char *argv[])
 {
+    /* Create a dummy file, which holds commit status */
+    //char *ptr = create_dummy_pmem_file();
+
+    //printf("Value on pmem is : %s\n", ptr);
+    if(argc>1){
+        if(strcmp(argv[1], "producer") == 0){
+            run_producer();
+        } else if (strcmp(argv[1], "consumer_with_pmemlog") == 0){
+            run_consumer();
+        /* Use another class for this */
+        } else if (strcmp(argv[1], "consumer_with_pmemobj") == 0) {
+            run_consumer();
+        } else if(strcmp(argv[1], "recover") == 0){
+            execute_in_recovery_mode();
+            /* Find the latest psm file,
+             * count it's elements.
+             * Open the pmem obj file, which contains head
+             * read the status of the last operation.
+             * If the operation was commited - increase the number of
+             * commited messages by 1.
+             * Open sm log and run walk method, while ignoring
+             * the number equal to a number of commit markers.
+             * */
+        }
+    }
+
     recovering = false;
-    run_producer();
-    //create_dest_log_file(get_lowest_index_that_can_be_processed("/mnt/dax/test_outputs/pmem_logs/sm/"));
-    run_consumer();
-
-
-
-    /* print the log contents */
-    //pmemlog_walk(plp_src, 0, process_log, NULL);
-    //pmemlog_walk(plp_dest, 0, printit_dest, NULL);
-    //printf("Commited operations %d\n", commited_records);
-
-    //pmemlog_close(plp_src);
-    //pmemlog_close(plp_dest);
     return 0;
 }
